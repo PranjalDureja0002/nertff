@@ -98,6 +98,53 @@ def _validate_sql(sql: str, provider: str = "postgresql") -> Tuple[bool, str]:
     return True, "OK"
 
 
+def _post_process_sql(sql: str, provider: str = "postgresql", max_rows: int = 100) -> Tuple[str, List[str]]:
+    """Hardcoded post-processing fixes applied to every generated SQL.
+
+    These run independently of customer anti-pattern files.
+    ``max_rows`` comes from the UI-configurable "Max Result Rows" input.
+    Returns (fixed_sql, list_of_fixes).
+    """
+    fixes = []
+
+    # 1. Cap absurd FETCH FIRST values — use the UI-configured max_rows
+    fetch_match = re.search(r"FETCH\s+FIRST\s+(\d+)\s+ROWS?\s+ONLY", sql, re.IGNORECASE)
+    if fetch_match:
+        n = int(fetch_match.group(1))
+        if n > max_rows:
+            sql = re.sub(
+                r"FETCH\s+FIRST\s+\d+\s+ROWS?\s+ONLY",
+                f"FETCH FIRST {max_rows} ROWS ONLY",
+                sql, flags=re.IGNORECASE,
+            )
+            fixes.append(f"Capped FETCH FIRST {n} → {max_rows} (configured max rows)")
+
+    # 2. Cap absurd LIMIT values — use the UI-configured max_rows
+    limit_match = re.search(r"\bLIMIT\s+(\d+)", sql, re.IGNORECASE)
+    if limit_match:
+        n = int(limit_match.group(1))
+        if n > max_rows:
+            sql = re.sub(r"\bLIMIT\s+\d+", f"LIMIT {max_rows}", sql, flags=re.IGNORECASE)
+            fixes.append(f"Capped LIMIT {n} → {max_rows} (configured max rows)")
+
+    # 3. Remove redundant TO_CHAR fiscal year filters when mandatory date filter exists
+    # Pattern: AND TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')
+    fiscal_pattern = re.compile(
+        r"\s*AND\s+TO_CHAR\s*\(\s*INVOICE_DATE\s*,\s*'YYYY'\s*\)\s*=\s*TO_CHAR\s*\(\s*SYSDATE\s*,\s*'YYYY'\s*\)",
+        re.IGNORECASE,
+    )
+    if fiscal_pattern.search(sql):
+        sql = fiscal_pattern.sub("", sql)
+        fixes.append("Removed redundant TO_CHAR(INVOICE_DATE,'YYYY')=TO_CHAR(SYSDATE,'YYYY') — mandatory date filter already constrains timeframe")
+
+    # 4. Strip trailing semicolons (Oracle driver chokes on them)
+    if sql.rstrip().endswith(";"):
+        sql = sql.rstrip().rstrip(";").rstrip()
+        fixes.append("Removed trailing semicolon")
+
+    return sql, fixes
+
+
 def _enforce_oracle_date_filter(sql: str) -> Tuple[str, bool]:
     """Ensure Oracle queries always have the mandatory INVOICE_DATE filter.
 
@@ -719,6 +766,9 @@ Return ONLY the JSON, no explanations."""
 5. Follow the SQL dialect rules above for row limiting and date functions
 6. For aggregations, always include GROUP BY
 7. Return ONLY the SQL query, no explanations
+8. **LIKE for text matching:** For ALL text/name/string column filters (SUPPLIER_NAME, MATERIAL_GROUP, PLANT_NAME, REGION, COUNTRY, etc.), ALWAYS use `UPPER(column) LIKE '%VALUE%'` instead of `= 'VALUE'`. Names in the database have variations in spelling, casing, and formatting — exact match with = will miss valid rows. Example: use `UPPER(SUPPLIER_NAME) LIKE '%3M%'` NOT `SUPPLIER_NAME = '3M'`
+9. **No redundant date filters:** The system automatically injects a mandatory `INVOICE_DATE > DATE '2024-04-01'` filter. Do NOT add your own fiscal year or calendar year filters like `TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')` unless the user explicitly asks for a specific year. The mandatory date filter already constrains the timeframe.
+10. **Reasonable row limits:** When using FETCH FIRST / LIMIT, use a reasonable number (max """ + str(self.max_rows) + """). Never use absurdly large numbers like FETCH FIRST 10000000000 ROWS ONLY. If the user asks for "all" data, use FETCH FIRST """ + str(self.max_rows) + """ ROWS ONLY as a safety cap.
 
 **SQL Query:**""")
 
@@ -1137,6 +1187,135 @@ Return ONLY the JSON, no explanations."""
 
         return warnings
 
+    def _format_pipeline_trace(
+        self,
+        trace: dict,
+        normalized_query: str,
+        original_query: str,
+        pipeline_log: list,
+    ) -> str:
+        """Format the pipeline trace as a visible step-by-step breakdown."""
+        lines = ["\n---\n**Pipeline Trace** (7-Stage NL-to-SQL Resolution)\n"]
+
+        # Stage 0: Normalization
+        s0 = trace.get("stage_0_normalizer")
+        if s0:
+            lines.append("**Stage 0 — Query Normalization** (CODE)")
+            if original_query != normalized_query:
+                lines.append(f"- Original: `{original_query}`")
+                lines.append(f"- Normalized: `{normalized_query}`")
+            else:
+                lines.append(f"- Query: `{original_query}` (no changes)")
+            expansions = s0.get("expansions", [])
+            if expansions:
+                lines.append(f"- Expansions: {', '.join(expansions)}")
+            aliases = s0.get("alias_resolutions", [])
+            if aliases:
+                for a in aliases:
+                    lines.append(f"- Alias: `{a.get('alias', '?')}` → `{a.get('sql_filter', '?')}`")
+            lines.append("")
+
+        # Stage 1: Schema Linking
+        s1 = trace.get("stage_1_schema_linking")
+        if s1:
+            lines.append("**Stage 1 — Schema Linking** (LLM)")
+            resolved = s1.get("resolved_columns", {})
+            if resolved:
+                for term, col in resolved.items():
+                    lines.append(f"- `{term}` → `{col}`")
+            entities = s1.get("detected_entities", [])
+            if entities:
+                lines.append(f"- Entities: {', '.join(entities)}")
+            filters = s1.get("suggested_filters", [])
+            if filters:
+                lines.append(f"- Filters: {', '.join(str(f) for f in filters)}")
+            lines.append("")
+
+        # Stage 2: Intent Classification
+        s2 = trace.get("stage_2_intent")
+        if s2:
+            intent = s2.get("primary_intent", "unknown")
+            confidence = s2.get("confidence", 0)
+            level = s2.get("confidence_level", "?")
+            bar_len = int(confidence * 20)
+            bar = "\u2588" * bar_len + "\u2591" * (20 - bar_len)
+            lines.append("**Stage 2 — Intent Classification** (CODE)")
+            lines.append(f"- Intent: `{intent}` ({confidence:.0%}) {bar} {level.upper()}")
+            secondary = s2.get("secondary_intents", [])
+            if secondary:
+                lines.append(f"- Secondary: {', '.join(secondary)}")
+            lines.append("")
+
+        # Stage 3: Example Selection
+        s3 = trace.get("stage_3_examples")
+        if s3:
+            lines.append("**Stage 3 — Example Selection** (CODE)")
+            lines.append(f"- Selected {s3.get('selected', 0)} of {s3.get('total', 0)} examples")
+            lines.append("")
+
+        # Stage 4.25: Template Match
+        s425 = trace.get("stage_4_25_template")
+        if s425 and s425.get("matched"):
+            lines.append("**Stage 4.25 — Template Match** (CODE)")
+            lines.append("- Template matched — **LLM call skipped**")
+            lines.append("")
+
+        # Stage 4: SQL Generation
+        s4 = trace.get("stage_4_sql_gen")
+        if s4:
+            source = s4.get("source", "llm")
+            lines.append(f"**Stage 4 — SQL Generation** ({source.upper()})")
+            lines.append("")
+
+        # Post-processing & Anti-patterns
+        s45 = trace.get("stage_4_5_anti_patterns", [])
+        pp = trace.get("post_process_fixes", [])
+        all_fixes = s45 + pp
+        if all_fixes:
+            lines.append("**Stage 4.5 — Anti-Pattern & Post-Processing Fixes** (CODE)")
+            for fix in all_fixes:
+                lines.append(f"- {fix}")
+            lines.append("")
+
+        # Date filter injection
+        if trace.get("date_filter_injected"):
+            lines.append("**Safety** — Mandatory date filter injected: `INVOICE_DATE > DATE '2024-04-01'`\n")
+
+        # Stage 5: Validation
+        s5 = trace.get("stage_5_validation")
+        if s5:
+            ont_warnings = s5.get("ontology_warnings", [])
+            lines.append("**Stage 5 — Validation** (CODE)")
+            if ont_warnings:
+                for w in ont_warnings:
+                    lines.append(f"- \u26a0\ufe0f {w}")
+            else:
+                lines.append("- \u2705 SQL safety check passed")
+                lines.append("- \u2705 Ontology validation passed")
+            lines.append("")
+
+        # Stage 6: Execution
+        s6 = trace.get("stage_6_execution")
+        if s6:
+            lines.append("**Stage 6 — Execution** (DB)")
+            lines.append(f"- {s6.get('rows', 0)} rows returned in {s6.get('time_ms', 0)}ms")
+            lines.append("")
+
+        # Stage 7: Post-Result Validation
+        s7 = trace.get("stage_7_post_validation")
+        if s7:
+            warnings = s7.get("warnings", [])
+            lines.append("**Stage 7 — Post-Result Validation** (CODE)")
+            if warnings:
+                for w in warnings:
+                    lines.append(f"- \u26a0\ufe0f {w}")
+            else:
+                lines.append("- \u2705 No data quality issues detected")
+            lines.append("")
+
+        lines.append("---")
+        return "\n".join(lines)
+
     def _run_nl_to_sql(self) -> dict:
         """Multi-stage pipeline with smart filtering, template matching, and anti-pattern fixing."""
         if self._cached_result is not None:
@@ -1319,6 +1498,13 @@ Return ONLY the JSON, no explanations."""
             except Exception as e:
                 logger.warning(f"NL-to-SQL Stage 4.5 (Anti-Pattern) failed (non-fatal): {e}")
 
+        # ===== Built-in Post-Processing (always runs) =====
+        sql, pp_fixes = _post_process_sql(sql, provider, self.max_rows)
+        if pp_fixes:
+            anti_pattern_fixes.extend(pp_fixes)
+            pipeline_log.append(f"Post-process: {len(pp_fixes)} fix(es) — {'; '.join(pp_fixes)}")
+            pipeline_trace["post_process_fixes"] = pp_fixes
+
         # ===== Mandatory Date Filter (Oracle safety net) =====
         if provider == "oracle":
             sql, date_injected = _enforce_oracle_date_filter(sql)
@@ -1392,6 +1578,7 @@ Return ONLY the JSON, no explanations."""
             "row_count": len(rows),
             "execution_time_ms": exec_time,
             "user_query": user_query,
+            "normalized_query": normalized_query,
             "pipeline_log": pipeline_log,
             "pipeline_trace": pipeline_trace,
             "ontology_warnings": ontology_warnings,
@@ -1419,12 +1606,29 @@ Return ONLY the JSON, no explanations."""
         md_table = _format_results_as_markdown(result["columns"], [tuple(r) for r in result["rows"]])
         parts.append(md_table)
 
+        # Anti-pattern fixes applied
+        anti_fixes = result.get("anti_pattern_fixes", [])
+        if anti_fixes:
+            parts.append("\n**Auto-Fixes Applied:**")
+            for fix in anti_fixes:
+                parts.append(f"- {fix}")
+
         # Post-result validation warnings
         post_warnings = result.get("post_result_warnings", [])
         if post_warnings:
             parts.append("\n**Data Quality Notes:**")
             for w in post_warnings:
                 parts.append(f"- {w}")
+
+        # Pipeline trace — visible step-by-step breakdown
+        trace = result.get("pipeline_trace", {})
+        if trace:
+            parts.append(self._format_pipeline_trace(
+                trace,
+                result.get("normalized_query", result.get("user_query", "")),
+                result.get("user_query", ""),
+                result.get("pipeline_log", []),
+            ))
 
         self.status = f"{result['row_count']} rows returned"
         return Message(text="\n".join(parts))
