@@ -971,7 +971,7 @@ Return ONLY the JSON, no explanations."""
 6. For aggregations, always include GROUP BY
 7. Return ONLY the SQL query, no explanations
 8. **LIKE for text matching:** For ALL text/name/string column filters (SUPPLIER_NAME, MATERIAL_GROUP, PLANT_NAME, REGION, COUNTRY, etc.), ALWAYS use `UPPER(column) LIKE '%VALUE%'` instead of `= 'VALUE'`. Names in the database have variations in spelling, casing, and formatting — exact match with = will miss valid rows. Example: use `UPPER(SUPPLIER_NAME) LIKE '%3M%'` NOT `SUPPLIER_NAME = '3M'`
-9. **No redundant date filters:** The system automatically injects a mandatory `INVOICE_DATE > DATE '2024-04-01'` filter. Do NOT add your own fiscal year or calendar year filters like `TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')` unless the user explicitly asks for a specific year. The mandatory date filter already constrains the timeframe.
+9. **No redundant date filters:** The system automatically injects a mandatory `INVOICE_DATE > DATE '2024-04-01'` filter. Do NOT add your own fiscal year or calendar year filters like `TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')` or `EXTRACT(YEAR FROM INVOICE_DATE) = EXTRACT(YEAR FROM SYSDATE)` unless the user explicitly asks for a specific year. The mandatory date filter already constrains the timeframe.
 10. **Reasonable row limits:** When using FETCH FIRST / LIMIT, use a reasonable number (max """ + str(self.max_rows) + """). Never use absurdly large numbers like FETCH FIRST 10000000000 ROWS ONLY. If the user asks for "all" data, use FETCH FIRST """ + str(self.max_rows) + """ ROWS ONLY as a safety cap.
 
 **SQL Query:**""")

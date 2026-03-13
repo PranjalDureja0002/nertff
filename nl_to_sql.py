@@ -127,15 +127,24 @@ def _post_process_sql(sql: str, provider: str = "postgresql", max_rows: int = 10
             sql = re.sub(r"\bLIMIT\s+\d+", f"LIMIT {max_rows}", sql, flags=re.IGNORECASE)
             fixes.append(f"Capped LIMIT {n} → {max_rows} (configured max rows)")
 
-    # 3. Remove redundant TO_CHAR fiscal year filters when mandatory date filter exists
-    # Pattern: AND TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')
-    fiscal_pattern = re.compile(
+    # 3. Remove redundant fiscal year filters when mandatory date filter exists
+    # Pattern A: AND TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')
+    fiscal_tochar = re.compile(
         r"\s*AND\s+TO_CHAR\s*\(\s*INVOICE_DATE\s*,\s*'YYYY'\s*\)\s*=\s*TO_CHAR\s*\(\s*SYSDATE\s*,\s*'YYYY'\s*\)",
         re.IGNORECASE,
     )
-    if fiscal_pattern.search(sql):
-        sql = fiscal_pattern.sub("", sql)
-        fixes.append("Removed redundant TO_CHAR(INVOICE_DATE,'YYYY')=TO_CHAR(SYSDATE,'YYYY') — mandatory date filter already constrains timeframe")
+    if fiscal_tochar.search(sql):
+        sql = fiscal_tochar.sub("", sql)
+        fixes.append("Removed redundant TO_CHAR fiscal year filter — mandatory date filter already constrains timeframe")
+
+    # Pattern B: AND EXTRACT(YEAR FROM INVOICE_DATE) = EXTRACT(YEAR FROM SYSDATE)
+    fiscal_extract = re.compile(
+        r"\s*AND\s+EXTRACT\s*\(\s*YEAR\s+FROM\s+INVOICE_DATE\s*\)\s*=\s*EXTRACT\s*\(\s*YEAR\s+FROM\s+SYSDATE\s*\)",
+        re.IGNORECASE,
+    )
+    if fiscal_extract.search(sql):
+        sql = fiscal_extract.sub("", sql)
+        fixes.append("Removed redundant EXTRACT(YEAR) fiscal year filter — mandatory date filter already constrains timeframe")
 
     # 4. Strip trailing semicolons (Oracle driver chokes on them)
     if sql.rstrip().endswith(";"):
@@ -767,7 +776,7 @@ Return ONLY the JSON, no explanations."""
 6. For aggregations, always include GROUP BY
 7. Return ONLY the SQL query, no explanations
 8. **LIKE for text matching:** For ALL text/name/string column filters (SUPPLIER_NAME, MATERIAL_GROUP, PLANT_NAME, REGION, COUNTRY, etc.), ALWAYS use `UPPER(column) LIKE '%VALUE%'` instead of `= 'VALUE'`. Names in the database have variations in spelling, casing, and formatting — exact match with = will miss valid rows. Example: use `UPPER(SUPPLIER_NAME) LIKE '%3M%'` NOT `SUPPLIER_NAME = '3M'`
-9. **No redundant date filters:** The system automatically injects a mandatory `INVOICE_DATE > DATE '2024-04-01'` filter. Do NOT add your own fiscal year or calendar year filters like `TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')` unless the user explicitly asks for a specific year. The mandatory date filter already constrains the timeframe.
+9. **No redundant date filters:** The system automatically injects a mandatory `INVOICE_DATE > DATE '2024-04-01'` filter. Do NOT add your own fiscal year or calendar year filters like `TO_CHAR(INVOICE_DATE, 'YYYY') = TO_CHAR(SYSDATE, 'YYYY')` or `EXTRACT(YEAR FROM INVOICE_DATE) = EXTRACT(YEAR FROM SYSDATE)` unless the user explicitly asks for a specific year. The mandatory date filter already constrains the timeframe.
 10. **Reasonable row limits:** When using FETCH FIRST / LIMIT, use a reasonable number (max """ + str(self.max_rows) + """). Never use absurdly large numbers like FETCH FIRST 10000000000 ROWS ONLY. If the user asks for "all" data, use FETCH FIRST """ + str(self.max_rows) + """ ROWS ONLY as a safety cap.
 
 **SQL Query:**""")
