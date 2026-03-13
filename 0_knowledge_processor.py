@@ -1,229 +1,402 @@
 # Paste this into a Custom Code component's Code tab
-# Knowledge Processor — ingests 13 artifact types, outputs unified knowledge dict
-# Replaces backend Knowledge Layer for Custom Code flows
+# Knowledge Processor — ingests knowledge artifacts, outputs unified knowledge dict
+# Handles both file PATHS and raw CONTENT from Knowledge Base component
 
 from agentcore.custom import Node
 import json
 import re
-
-# ─── Artifact Detection ───────────────────────────────────────────────────────
-
-def _detect_artifact_type(parsed, filename=""):
-    """Detect knowledge artifact type from content structure."""
-    if isinstance(parsed, dict):
-        keys = set(parsed.keys())
-
-        # Knowledge graph: entities + relationships
-        if "entities" in keys and ("relationships" in keys or "relations" in keys):
-            return "knowledge_graph_file"
-
-        # Ontology: hierarchies + (valid_combinations or constraints)
-        if "hierarchies" in keys and ("valid_combinations" in keys or "constraints" in keys):
-            return "ontology_file"
-
-        # Semantic layer: columns + (entity_mappings or cardinality_summary)
-        if "columns" in keys and ("entity_mappings" in keys or "cardinality_summary" in keys):
-            return "semantic_layer_file"
-
-        # Context graph: question_types
-        if "question_types" in keys:
-            return "context_graph_file"
-
-        # Synonyms: column_synonyms
-        if "column_synonyms" in keys:
-            return "synonyms_file"
-
-        # Business rules: metrics + (exclusion_rules or time_filters or oracle_syntax)
-        if "metrics" in keys and (
-            "exclusion_rules" in keys or "exclusions" in keys
-            or "time_filters" in keys or "oracle_syntax" in keys
-            or "oracle_specific" in keys
-        ):
-            return "business_rules_file"
-
-        # Few-shot examples: has "examples" list with question/sql dicts
-        if "examples" in keys and isinstance(parsed.get("examples"), list):
-            ex_list = parsed["examples"]
-            if ex_list and isinstance(ex_list[0], dict):
-                if "question" in ex_list[0] or "input" in ex_list[0] or "sql" in ex_list[0]:
-                    return "examples_file"
-
-        # Domain terms / translations: column_mappings
-        if "column_mappings" in keys:
-            return "domain_terms_file"
-
-        # SQL templates: has "templates" key with template/sql_template items
-        if "templates" in keys:
-            templates_val = parsed.get("templates", {})
-            if isinstance(templates_val, dict):
-                sample = next(iter(templates_val.values()), None)
-                if isinstance(sample, dict) and ("template" in sample or "sql_template" in sample):
-                    return "sql_templates_file"
-
-        # Anti-patterns: has "anti_patterns" list
-        if "anti_patterns" in keys:
-            ap_val = parsed.get("anti_patterns", [])
-            if isinstance(ap_val, list):
-                return "anti_patterns_file"
-
-        # Column values: columns + columns_by_tier, or columns with cardinality/values
-        if "columns" in keys and "columns_by_tier" in keys:
-            return "column_values_file"
-        if "columns" in keys:
-            cols_val = parsed.get("columns", {})
-            if isinstance(cols_val, dict):
-                sample = next(iter(cols_val.values()), None)
-                if isinstance(sample, dict) and ("cardinality" in sample or "values" in sample or "tier" in sample):
-                    return "column_values_file"
-
-        # Entity aliases: region_aliases, business_concepts, oem_aliases, etc.
-        if any(k in keys for k in ("region_aliases", "business_concepts", "oem_aliases", "commodity_aliases", "country_aliases")):
-            return "entities_aliases_file"
-
-        # Schema columns: top-level values are dicts with type/category/description
-        if keys:
-            sample_values = [parsed[k] for k in list(keys)[:5] if isinstance(parsed[k], dict)]
-            if len(sample_values) >= 3:
-                sample = sample_values[0]
-                if any(k in sample for k in ("type", "data_type", "category", "description")):
-                    return "schema_columns_file"
-
-    # List of examples (bare list format)
-    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-        if "question" in parsed[0] or "input" in parsed[0]:
-            return "examples_file"
-
-    # Filename fallback
-    _FILENAME_HINTS = {
-        "knowledge_graph": "knowledge_graph_file", "ontology": "ontology_file",
-        "semantic_layer": "semantic_layer_file", "context_graph": "context_graph_file",
-        "synonym": "synonyms_file", "business_rule": "business_rules_file",
-        "example": "examples_file", "term": "domain_terms_file",
-        "sql_template": "sql_templates_file", "template": "sql_templates_file",
-        "anti_pattern": "anti_patterns_file", "column_value": "column_values_file",
-        "histogram": "column_values_file", "entities_alias": "entities_aliases_file",
-        "alias": "entities_aliases_file",
-    }
-    fname_lower = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].rsplit(".", 1)[0].lower() if filename else ""
-    for hint, slot in _FILENAME_HINTS.items():
-        if hint in fname_lower:
-            return slot
-
-    return None
+import os
 
 
-# ─── Parsing Helpers ──────────────────────────────────────────────────────────
+# ─── File Reading & Parsing ──────────────────────────────────────────────────
 
-def _parse_text(text):
-    """Try parsing as JSON first, then YAML fallback."""
+def _read_file(path):
+    """Read a file and return its text content."""
+    path = path.strip().strip('"').strip("'")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _parse_content(text, filename=""):
+    """Parse file content — tries JSON first, then YAML, then flat YAML."""
     text = text.strip()
     if not text:
         return None
+
+    # JSON
     if text.startswith(("{", "[")):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
-    # YAML fallback
+
+    # YAML (standard indented)
     try:
         import yaml
         result = yaml.safe_load(text)
         if isinstance(result, (dict, list)):
-            return result
+            # Validate: yaml.safe_load on flat YAML returns dicts with None values
+            # Check if most values are None — if so, it's flat YAML parsed wrong
+            if isinstance(result, dict) and len(result) > 3:
+                none_count = sum(1 for v in result.values() if v is None)
+                if none_count > len(result) * 0.5:
+                    pass  # Fall through to flat YAML parser
+                else:
+                    return result
+            else:
+                return result
     except Exception:
         pass
-    # Try JSON even without { prefix (some files have whitespace)
+
+    # JSON (retry without prefix check)
     try:
         return json.loads(text)
     except Exception:
         pass
+
+    # Flat YAML (zero-indent files used in knowledge artifacts)
+    result = _parse_flat_yaml(text)
+    if result and isinstance(result, dict) and len(result) > 0:
+        return result
+
     return None
 
 
-def _safe_parse(raw):
-    """Parse raw file content into dict/list. Handles Message, Data, dict, str."""
-    if raw is None:
+# ─── Filename-Based Type Detection ───────────────────────────────────────────
+
+_FILENAME_TO_TYPE = {
+    "knowledge_graph": "knowledge_graph_file",
+    "context_graph": "context_graph_file",
+    "semantic_layer": "semantic_layer_file",
+    "semantic": "semantic_layer_file",
+    "ontology": "ontology_file",
+    "synonym": "synonyms_file",
+    "business_rule": "business_rules_file",
+    "example": "examples_file",
+    "german_term": "domain_terms_file",
+    "german_column": "domain_terms_file",
+    "domain_term": "domain_terms_file",
+    "column_value": "column_values_file",
+    "histogram": "column_values_file",
+    "alias": "entities_aliases_file",
+    "entities_alias": "entities_aliases_file",
+    "anti_pattern": "anti_patterns_file",
+    "sql_template": "sql_templates_file",
+    "template": "sql_templates_file",
+    "columns": "schema_columns_file",
+}
+
+
+def _detect_type_by_filename(filename):
+    """Detect artifact type from filename."""
+    if not filename:
         return None
-    # Message objects have .text attribute (from Knowledge Base)
-    if hasattr(raw, "text") and isinstance(raw.text, str):
-        return _parse_text(raw.text)
-    # Data objects have .data attribute
-    if hasattr(raw, "data"):
-        inner = raw.data
-        if isinstance(inner, dict):
-            text = inner.get("text") or inner.get("content") or inner.get("file_content")
-            if text and isinstance(text, str):
-                return _parse_text(text)
-            return inner
-        if isinstance(inner, str):
-            return _parse_text(inner)
-        return inner
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        return _parse_text(raw)
+    base = os.path.basename(filename).rsplit(".", 1)[0].lower()
+    for hint, slot in _FILENAME_TO_TYPE.items():
+        if hint in base:
+            return slot
     return None
+
+
+def _detect_type_by_content(parsed, filename=""):
+    """Detect artifact type from content structure."""
+    # Try filename first
+    slot = _detect_type_by_filename(filename)
+    if slot:
+        return slot
+
+    if not isinstance(parsed, dict):
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            if "question" in parsed[0] or "sql" in parsed[0]:
+                return "examples_file"
+        return None
+
+    keys = set(parsed.keys())
+
+    if "entities" in keys and ("relationships" in keys or "relations" in keys):
+        return "knowledge_graph_file"
+    if "hierarchies" in keys and ("valid_combinations" in keys or "constraints" in keys):
+        return "ontology_file"
+    if "columns" in keys and ("entity_mappings" in keys or "cardinality_summary" in keys):
+        return "semantic_layer_file"
+    if "question_types" in keys:
+        return "context_graph_file"
+    if "column_synonyms" in keys:
+        return "synonyms_file"
+    if "columns" in keys and ("aggregations" in keys or "patterns" in keys or "phrases" in keys):
+        return "synonyms_file"
+    if "metrics" in keys and ("exclusion_rules" in keys or "time_filters" in keys or "oracle_syntax" in keys):
+        return "business_rules_file"
+    if "examples" in keys:
+        ex = parsed.get("examples")
+        if isinstance(ex, list) and ex and isinstance(ex[0], dict):
+            return "examples_file"
+    if "column_mappings" in keys or "german_columns" in keys:
+        return "domain_terms_file"
+    if "view_name" in keys and "columns" in keys:
+        return "schema_columns_file"
+    if "templates" in keys:
+        return "sql_templates_file"
+    if "anti_patterns" in keys:
+        return "anti_patterns_file"
+    if any(k in keys for k in ("region_aliases", "oem_aliases", "business_concepts")):
+        return "entities_aliases_file"
+
+    return None
+
+
+# ─── Flat YAML Parser (for zero-indent knowledge files) ─────────────────────
+
+_LIKELY_TOP_KEYS = {
+    'metadata', 'metrics', 'time_filters', 'exclusion_rules', 'oracle_syntax',
+    'query_templates', 'question_types', 'columns', 'column_synonyms',
+    'column_mappings', 'german_columns', 'concepts', 'hierarchies',
+    'valid_combinations', 'constraints', 'entity_mappings', 'cardinality_summary',
+    'filter_hints', 'examples', 'entities', 'relationships', 'aggregations',
+    'patterns', 'phrases', 'templates', 'anti_patterns', 'view_name',
+    'extracted_at', 'total_columns', 'unique_columns', 'duplicate_count',
+    'region_aliases', 'country_aliases', 'oem_aliases', 'commodity_aliases',
+    'business_concepts', 'exclusions', 'properties', 'columns_by_tier',
+}
+
+
+def _yaml_value(val_str):
+    """Convert a YAML value string to a Python type."""
+    if not val_str:
+        return None
+    if (val_str.startswith('"') and val_str.endswith('"')) or \
+       (val_str.startswith("'") and val_str.endswith("'")):
+        return val_str[1:-1]
+    if val_str.startswith('[') and val_str.endswith(']'):
+        inner = val_str[1:-1].strip()
+        if not inner:
+            return []
+        return [item.strip().strip('"').strip("'") for item in re.split(r',\s*', inner) if item.strip()]
+    if val_str.lower() in ('true', 'yes'):
+        return True
+    if val_str.lower() in ('false', 'no'):
+        return False
+    if val_str.lower() in ('null', 'none', '~'):
+        return None
+    try:
+        return float(val_str) if '.' in val_str else int(val_str)
+    except ValueError:
+        return val_str
+
+
+def _parse_flat_yaml(text):
+    """Parse flat YAML (zero indentation) into a structured dict."""
+    lines = text.replace('\r\n', '\n').split('\n')
+    result = {}
+    current_section = None
+    current_item = None
+    current_item_key = None
+    items_in_section = {}
+    section_list_items = []
+    in_block_scalar = False
+    block_lines = []
+    block_key = None
+    in_list = False
+    list_key = None
+    list_items = []
+    section_list_data = {}
+
+    def _flush_block():
+        nonlocal in_block_scalar, block_lines, block_key
+        if in_block_scalar and block_key and current_item is not None:
+            current_item[block_key] = '\n'.join(block_lines)
+        in_block_scalar = False
+        block_lines = []
+        block_key = None
+
+    def _flush_list():
+        nonlocal in_list, list_items, list_key
+        if in_list and list_key and current_item is not None:
+            current_item[list_key] = list_items
+        in_list = False
+        list_items = []
+        list_key = None
+
+    def _flush_item():
+        nonlocal current_item, current_item_key
+        _flush_block()
+        _flush_list()
+        if current_item_key and current_item is not None:
+            if current_item_key == '__list_item__':
+                section_list_items.append(current_item)
+            else:
+                items_in_section[current_item_key] = current_item
+        current_item = None
+        current_item_key = None
+
+    def _flush_section():
+        nonlocal current_section, items_in_section, section_list_items
+        _flush_item()
+        if current_section:
+            if section_list_items and not items_in_section:
+                result[current_section] = list(section_list_items)
+            elif items_in_section:
+                section_data = dict(items_in_section)
+                if '__direct__' in section_data:
+                    direct = section_data.pop('__direct__')
+                    if isinstance(direct, dict):
+                        section_data.update(direct)
+                result[current_section] = section_data
+            elif current_section in section_list_data:
+                result[current_section] = section_list_data[current_section]
+        items_in_section = {}
+        section_list_items = []
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+
+        if not stripped:
+            _flush_block()
+            _flush_list()
+            if current_item_key and current_item is not None:
+                _flush_item()
+            continue
+
+        if stripped.startswith('#'):
+            continue
+
+        if in_block_scalar:
+            if re.match(r'^[A-Za-z_"\'][A-Za-z0-9_ .()"\'/]*:\s', stripped) or \
+               (stripped.endswith(':') and not stripped.startswith(('SELECT', 'FROM', 'WHERE'))):
+                _flush_block()
+            else:
+                block_lines.append(stripped)
+                continue
+
+        if stripped.startswith('- '):
+            item_val = stripped[2:].strip()
+            if not in_list and current_item is None and current_section:
+                if current_section not in section_list_data:
+                    section_list_data[current_section] = []
+                if ': ' in item_val or item_val.endswith(':'):
+                    current_item = {}
+                    current_item_key = '__list_item__'
+                    k, _, v = item_val.partition(':')
+                    current_item[k.strip()] = v.strip() if v.strip() else None
+                    continue
+                else:
+                    section_list_data[current_section].append(item_val.strip('"').strip("'"))
+                    continue
+            if in_list:
+                list_items.append(item_val.strip('"').strip("'"))
+            elif current_item is not None:
+                in_list = True
+                list_items = [item_val.strip('"').strip("'")]
+            continue
+
+        colon_idx = stripped.find(':')
+        if colon_idx > 0:
+            key = stripped[:colon_idx].strip().strip('"').strip("'")
+            value = stripped[colon_idx + 1:].strip()
+            _flush_list()
+
+            if not value:
+                if current_section is None or (key in _LIKELY_TOP_KEYS and (current_item is None or current_item_key == '__direct__')):
+                    _flush_section()
+                    current_section = key
+                elif current_item is None:
+                    current_item = {}
+                    current_item_key = key
+                else:
+                    in_list = True
+                    list_key = key
+                    list_items = []
+            elif value in ('|', '>'):
+                if current_item is None:
+                    current_item = {}
+                    current_item_key = key
+                    in_block_scalar = True
+                    block_key = '__content__'
+                    block_lines = []
+                else:
+                    in_block_scalar = True
+                    block_key = key
+                    block_lines = []
+            else:
+                if key in _LIKELY_TOP_KEYS and (current_item is None or current_item_key == '__direct__'):
+                    _flush_section()
+                    result[key] = _yaml_value(value)
+                    continue
+                if current_item is None:
+                    if current_section:
+                        current_item = {}
+                        current_item_key = '__direct__'
+                    else:
+                        result[key] = _yaml_value(value)
+                        continue
+                current_item[key] = _yaml_value(value)
+            continue
+
+    _flush_section()
+    return result if result else None
 
 
 # ─── Build Methods ────────────────────────────────────────────────────────────
 
 def _build_synonym_map(synonyms_data, semantic_layer, domain_terms):
     synonym_map = {}
-
     if synonyms_data:
-        col_syns = synonyms_data.get("column_synonyms", synonyms_data)
+        col_syns = synonyms_data.get("column_synonyms") or synonyms_data.get("columns") or synonyms_data
         if isinstance(col_syns, dict):
             for col_name, syn_info in col_syns.items():
-                if isinstance(syn_info, list):
-                    synonyms_list = syn_info
-                elif isinstance(syn_info, dict):
-                    synonyms_list = syn_info.get("synonyms", [])
-                else:
-                    continue
-                for s in synonyms_list:
+                syns = syn_info if isinstance(syn_info, list) else (syn_info.get("synonyms", []) if isinstance(syn_info, dict) else [])
+                for s in syns:
                     s_lower = str(s).lower().strip()
                     if s_lower:
                         synonym_map[s_lower] = {"column": col_name, "source": "synonyms_file"}
-
+        for section_key in ("aggregations", "patterns"):
+            section = synonyms_data.get(section_key, {})
+            if isinstance(section, dict):
+                for name, info in section.items():
+                    if isinstance(info, dict):
+                        for s in info.get("synonyms", []):
+                            s_lower = str(s).lower().strip()
+                            if s_lower and s_lower not in synonym_map:
+                                synonym_map[s_lower] = {"column": name, "source": f"synonyms_{section_key}"}
+        phrases = synonyms_data.get("phrases", {})
+        if isinstance(phrases, dict):
+            for phrase, info in phrases.items():
+                p_lower = str(phrase).lower().strip()
+                if p_lower and p_lower not in synonym_map:
+                    sql = info.get("sql", "") if isinstance(info, dict) else str(info)
+                    synonym_map[p_lower] = {"column": sql, "source": "synonyms_phrases"}
     if semantic_layer:
-        columns = semantic_layer.get("columns", {})
-        for col_name, col_info in columns.items():
+        for col_name, col_info in semantic_layer.get("columns", {}).items():
             if isinstance(col_info, dict):
                 for s in col_info.get("synonyms", []):
                     s_lower = str(s).lower().strip()
                     if s_lower and s_lower not in synonym_map:
-                        synonym_map[s_lower] = {
-                            "column": col_name,
-                            "entity": col_info.get("entity", ""),
-                            "type": col_info.get("type", ""),
-                            "source": "semantic_layer",
-                        }
-
+                        synonym_map[s_lower] = {"column": col_name, "entity": col_info.get("entity", ""), "source": "semantic_layer"}
     if domain_terms:
-        terms = domain_terms.get("column_mappings", domain_terms)
+        terms = domain_terms.get("column_mappings") or domain_terms.get("german_columns") or domain_terms
         if isinstance(terms, dict):
-            for col_name, term_info in terms.items():
-                if isinstance(term_info, dict):
-                    for s in term_info.get("translations", []):
+            for col_name, info in terms.items():
+                if isinstance(info, dict):
+                    for s in info.get("translations", []):
                         s_lower = str(s).lower().strip()
                         if s_lower and s_lower not in synonym_map:
                             synonym_map[s_lower] = {"column": col_name, "source": "domain_terms"}
-                    for key in ("german", "native", "term", "abbreviation"):
-                        native = term_info.get(key, "")
-                        if native:
-                            synonym_map[native.lower().strip()] = {"column": col_name, "source": "domain_terms"}
-                elif isinstance(term_info, str):
-                    synonym_map[term_info.lower().strip()] = {"column": col_name, "source": "domain_terms"}
-
+                    for k in ("german", "native", "term", "abbreviation"):
+                        v = info.get(k, "")
+                        if v:
+                            synonym_map[v.lower().strip()] = {"column": col_name, "source": "domain_terms"}
     return synonym_map
 
 
-def _build_entities(knowledge_graph, semantic_layer):
+def _build_entities(kg, sl):
     entities = {}
-
-    if knowledge_graph:
-        kg_entities = knowledge_graph.get("entities", {})
-        for name, info in kg_entities.items():
+    if kg:
+        for name, info in kg.get("entities", {}).items():
             if isinstance(info, dict):
                 entities[name] = {
                     "type": info.get("type", "dimension"),
@@ -233,14 +406,10 @@ def _build_entities(knowledge_graph, semantic_layer):
                     "measures": info.get("measures", []),
                     "description": info.get("description", ""),
                 }
-
-    if semantic_layer:
-        mappings = semantic_layer.get("entity_mappings", {})
-        for name, mapping in mappings.items():
+    if sl:
+        for name, mapping in sl.get("entity_mappings", {}).items():
             if isinstance(mapping, dict) and name in entities:
                 entities[name]["id_column"] = mapping.get("id_column", "")
-                entities[name]["display_column"] = mapping.get("display_column", entities[name].get("display_column", ""))
-
     return entities
 
 
@@ -248,313 +417,76 @@ def _build_hierarchies(ontology):
     hierarchies = {}
     if not ontology:
         return hierarchies
-
-    ont_hierarchies = ontology.get("hierarchies", {})
-    for name, h_info in ont_hierarchies.items():
-        if isinstance(h_info, dict):
-            levels = []
-            for level in h_info.get("levels", []):
-                if isinstance(level, dict):
-                    levels.append({
-                        "level": level.get("level", 0),
-                        "name": level.get("name", ""),
-                        "column": level.get("column", ""),
-                        "description_column": level.get("description_column", ""),
-                    })
-            hierarchies[name] = {
-                "name": h_info.get("name", name),
-                "description": h_info.get("description", ""),
-                "levels": levels,
-                "drill_down": h_info.get("drill_down", True),
-                "roll_up": h_info.get("roll_up", True),
-            }
-
+    for name, h in ontology.get("hierarchies", {}).items():
+        if isinstance(h, dict):
+            levels = [{"level": l.get("level", 0), "name": l.get("name", ""), "column": l.get("column", "")}
+                      for l in h.get("levels", []) if isinstance(l, dict)]
+            hierarchies[name] = {"name": h.get("name", name), "levels": levels, "description": h.get("description", "")}
     return hierarchies
 
 
 def _build_business_rules(rules_data):
-    rules = {
-        "metrics": {},
-        "exclusion_rules": [],
-        "time_filters": {},
-        "classification_rules": {},
-        "oracle_syntax": {},
-    }
+    rules = {"metrics": {}, "exclusion_rules": [], "time_filters": {}, "oracle_syntax": {}}
     if not rules_data:
         return rules
-
-    metrics = rules_data.get("metrics", {})
-    if isinstance(metrics, dict):
-        for name, info in metrics.items():
-            if isinstance(info, dict):
-                rules["metrics"][name] = info.get("sql", info.get("expression", str(info)))
-            elif isinstance(info, str):
-                rules["metrics"][name] = info
-
+    for name, info in rules_data.get("metrics", {}).items():
+        rules["metrics"][name] = info.get("sql", info.get("expression", str(info))) if isinstance(info, dict) else str(info)
     exclusions = rules_data.get("exclusion_rules", rules_data.get("exclusions", []))
     if isinstance(exclusions, dict):
         for name, info in exclusions.items():
-            if isinstance(info, dict):
-                rules["exclusion_rules"].append(f"{name}: {info.get('condition', info.get('sql', ''))}")
-            elif isinstance(info, str):
-                rules["exclusion_rules"].append(f"{name}: {info}")
+            rules["exclusion_rules"].append(f"{name}: {info.get('condition', str(info)) if isinstance(info, dict) else info}")
     elif isinstance(exclusions, list):
         rules["exclusion_rules"] = [str(e) for e in exclusions]
-
-    time_filters = rules_data.get("time_filters", {})
-    if isinstance(time_filters, dict):
-        rules["time_filters"] = {
-            k: (v.get("sql", str(v)) if isinstance(v, dict) else str(v))
-            for k, v in time_filters.items()
-        }
-
+    tf = rules_data.get("time_filters", {})
+    if isinstance(tf, dict):
+        rules["time_filters"] = {k: (v.get("sql", str(v)) if isinstance(v, dict) else str(v)) for k, v in tf.items()}
     oracle = rules_data.get("oracle_syntax", rules_data.get("oracle_specific", {}))
     if isinstance(oracle, dict):
         rules["oracle_syntax"] = {k: str(v) for k, v in oracle.items()}
-
     return rules
-
-
-def _build_column_value_hints(semantic_layer):
-    hints = {}
-    if not semantic_layer:
-        return hints
-
-    columns = semantic_layer.get("columns", {})
-    for col_name, col_info in columns.items():
-        if isinstance(col_info, dict):
-            card_info = col_info.get("cardinality_info", {})
-            if isinstance(card_info, dict) and card_info.get("unique_values"):
-                unique = card_info.get("unique_values", 0)
-                if unique < 200:
-                    hints[col_name] = {
-                        "cardinality": "low" if unique < 50 else "medium",
-                        "unique_values": unique,
-                        "examples": card_info.get("examples", []),
-                        "description": col_info.get("description", ""),
-                    }
-
-    filter_hints = semantic_layer.get("filter_hints", {})
-    if isinstance(filter_hints, dict):
-        for col_name, hint_text in filter_hints.items():
-            if col_name in hints:
-                hints[col_name]["filter_hint"] = str(hint_text)
-            elif isinstance(hint_text, str):
-                hints[col_name] = {"filter_hint": hint_text}
-
-    return hints
 
 
 def _build_column_metadata(schema_columns, semantic_layer):
     columns = {}
-
     if schema_columns:
         col_defs = schema_columns.get("columns", schema_columns)
         if isinstance(col_defs, dict):
-            for col_name, info in col_defs.items():
+            for name, info in col_defs.items():
                 if isinstance(info, dict):
-                    columns[col_name] = {
-                        "type": info.get("type", ""),
-                        "category": info.get("category", ""),
-                        "description": info.get("description", ""),
-                        "nullable": info.get("nullable", True),
-                    }
-
+                    columns[name] = {"type": info.get("type", ""), "category": info.get("category", ""),
+                                     "description": info.get("description", ""), "nullable": info.get("nullable", True)}
     if semantic_layer:
-        sl_columns = semantic_layer.get("columns", {})
-        for col_name, info in sl_columns.items():
+        for name, info in semantic_layer.get("columns", {}).items():
             if isinstance(info, dict):
-                if col_name not in columns:
-                    columns[col_name] = {}
-                columns[col_name]["entity"] = info.get("entity", "")
-                columns[col_name]["semantic_type"] = info.get("type", "")
-                columns[col_name]["synonyms"] = info.get("synonyms", [])
-                if not columns[col_name].get("description"):
-                    columns[col_name]["description"] = info.get("description", "")
-
+                if name not in columns:
+                    columns[name] = {}
+                columns[name]["entity"] = info.get("entity", "")
+                columns[name]["synonyms"] = info.get("synonyms", [])
+                if not columns[name].get("description"):
+                    columns[name]["description"] = info.get("description", "")
     return columns
-
-
-def _build_sql_templates(templates_data):
-    templates = {}
-    if not templates_data:
-        return templates
-
-    raw_templates = templates_data.get("templates", templates_data)
-    if not isinstance(raw_templates, dict):
-        return templates
-
-    for name, info in raw_templates.items():
-        if not isinstance(info, dict):
-            continue
-        templates[name] = {
-            "patterns": info.get("patterns", []),
-            "template": info.get("template", info.get("sql_template", "")),
-            "description": info.get("description", ""),
-            "parameters": info.get("parameters", []),
-        }
-
-    return templates
-
-
-def _build_anti_patterns(anti_patterns_data):
-    patterns = []
-    if not anti_patterns_data:
-        return patterns
-
-    raw_patterns = anti_patterns_data.get("anti_patterns", [])
-    if not isinstance(raw_patterns, list):
-        return patterns
-
-    for ap in raw_patterns:
-        if not isinstance(ap, dict):
-            continue
-        regex_str = ap.get("pattern", "")
-        compiled = None
-        if regex_str:
-            try:
-                compiled = re.compile(regex_str, re.IGNORECASE)
-            except re.error:
-                pass
-        patterns.append({
-            "id": ap.get("id", ""),
-            "name": ap.get("name", ""),
-            "pattern": regex_str,
-            "compiled": compiled,
-            "severity": ap.get("severity", "warning"),
-            "description": ap.get("description", ""),
-            "fix": ap.get("fix", ""),
-        })
-
-    validation_rules = anti_patterns_data.get("validation_rules", [])
-    if isinstance(validation_rules, list):
-        for vr in validation_rules:
-            if isinstance(vr, dict):
-                regex_str = vr.get("pattern", "")
-                compiled = None
-                if regex_str:
-                    try:
-                        compiled = re.compile(regex_str, re.IGNORECASE)
-                    except re.error:
-                        pass
-                patterns.append({
-                    "id": vr.get("id", ""),
-                    "name": vr.get("name", ""),
-                    "pattern": regex_str,
-                    "compiled": compiled,
-                    "severity": "error" if vr.get("required") or vr.get("forbidden") else "info",
-                    "description": vr.get("description", ""),
-                    "required": vr.get("required", False),
-                    "forbidden": vr.get("forbidden", False),
-                    "fix": "",
-                })
-
-    return patterns
-
-
-def _build_column_values(column_values_data):
-    result = {}
-    if not column_values_data:
-        return result
-
-    columns = column_values_data.get("columns", {})
-    if not isinstance(columns, dict):
-        return result
-
-    tiers = column_values_data.get("columns_by_tier", {})
-    tier_lookup = {}
-    if isinstance(tiers, dict):
-        for tier_name, cols in tiers.items():
-            if isinstance(cols, list):
-                for col in cols:
-                    tier_lookup[str(col)] = tier_name
-
-    for col_name, col_info in columns.items():
-        if not isinstance(col_info, dict):
-            continue
-        cardinality = col_info.get("cardinality", 0)
-        tier = col_info.get("tier", tier_lookup.get(col_name, "UNKNOWN"))
-        values = []
-        raw_values = col_info.get("values", [])
-        if isinstance(raw_values, list):
-            for v in raw_values:
-                if isinstance(v, dict):
-                    values.append({
-                        "value": str(v.get("value", "")),
-                        "frequency": v.get("frequency", 0),
-                        "pct": v.get("pct_of_total", v.get("pct", 0)),
-                    })
-        result[col_name] = {"cardinality": cardinality, "tier": tier, "values": values}
-
-    return result
-
-
-def _build_entity_aliases(aliases_data):
-    aliases = {}
-    if not aliases_data:
-        return aliases
-
-    for alias_type, col_filter in [
-        ("region_aliases", "REGION"), ("country_aliases", "COUNTRY"),
-        ("oem_aliases", "CUSTOMER"), ("commodity_aliases", "COMMODITY_DESCRIPTION"),
-    ]:
-        type_data = aliases_data.get(alias_type, {})
-        if isinstance(type_data, dict):
-            type_name = alias_type.replace("_aliases", "")
-            for alias, canonical in type_data.items():
-                key = str(alias).lower().strip()
-                if key not in aliases:
-                    aliases[key] = {
-                        "type": type_name,
-                        "canonical_value": str(canonical),
-                        "sql_filter": f"{col_filter} = '{canonical}'",
-                    }
-
-    business_concepts = aliases_data.get("business_concepts", {})
-    if isinstance(business_concepts, dict):
-        for alias, sql_filter in business_concepts.items():
-            aliases[str(alias).lower().strip()] = {
-                "type": "business_concept",
-                "canonical_value": str(alias),
-                "sql_filter": str(sql_filter),
-            }
-
-    return aliases
 
 
 def _index_examples(examples_data):
     examples = []
     if not examples_data:
         return examples
-
-    if isinstance(examples_data, list):
-        ex_list = examples_data
-    elif isinstance(examples_data, dict):
-        ex_list = examples_data.get("examples", [])
-    else:
-        return examples
-
-    if isinstance(ex_list, list):
-        for ex in ex_list:
-            if isinstance(ex, dict):
-                examples.append({
-                    "question": ex.get("question") or ex.get("input", ""),
-                    "sql": ex.get("sql") or ex.get("output", ""),
-                    "category": ex.get("category", ""),
-                    "complexity": ex.get("complexity", 1),
-                    "tags": ex.get("tags", []),
-                })
-
+    ex_list = examples_data if isinstance(examples_data, list) else examples_data.get("examples", [])
+    for ex in (ex_list if isinstance(ex_list, list) else []):
+        if isinstance(ex, dict):
+            examples.append({"question": ex.get("question") or ex.get("input", ""),
+                             "sql": ex.get("sql") or ex.get("output", ""),
+                             "category": ex.get("category", ""), "complexity": ex.get("complexity", 1)})
     return examples
 
 
 def _build_intent_index(context_graph):
     index = {}
-    question_types = context_graph.get("question_types", {})
-    for intent_name, intent_def in question_types.items():
-        patterns = intent_def.get("patterns", [])
+    if not context_graph:
+        return index
+    for intent_name, intent_def in context_graph.get("question_types", {}).items():
         tokens = set()
-        for p in patterns:
+        for p in intent_def.get("patterns", []):
             for word in re.split(r"\s+", p.lower()):
                 word = word.strip(".,?!'\"")
                 if len(word) > 1:
@@ -563,22 +495,25 @@ def _build_intent_index(context_graph):
     return index
 
 
-def _build_valid_combinations(ontology):
-    if not ontology:
-        return {}
-    combos = ontology.get("valid_combinations", {})
-    constraints = ontology.get("constraints", {})
-    return {
-        "valid_combinations": combos if isinstance(combos, dict) else {},
-        "constraints": constraints if isinstance(constraints, dict) else {},
-    }
+def _build_entity_aliases(aliases_data):
+    aliases = {}
+    if not aliases_data:
+        return aliases
+    for alias_type, col in [("region_aliases", "REGION"), ("country_aliases", "COUNTRY"),
+                            ("oem_aliases", "CUSTOMER"), ("commodity_aliases", "COMMODITY_DESCRIPTION")]:
+        for alias, canonical in aliases_data.get(alias_type, {}).items():
+            aliases[str(alias).lower()] = {"type": alias_type.replace("_aliases", ""),
+                                           "canonical_value": str(canonical), "sql_filter": f"{col} = '{canonical}'"}
+    for alias, sql in aliases_data.get("business_concepts", {}).items():
+        aliases[str(alias).lower()] = {"type": "business_concept", "sql_filter": str(sql)}
+    return aliases
 
 
 # ─── Component ────────────────────────────────────────────────────────────────
 
 class CodeEditorNode(Node):
     display_name = "Knowledge Processor"
-    description = "Processes 13 knowledge artifact types into unified context. Pure code — no LLM cost."
+    description = "Processes knowledge artifacts (YAML/JSON) into unified context. Pure code."
     icon = "brain"
     name = "KnowledgeProcessor"
 
@@ -592,123 +527,147 @@ class CodeEditorNode(Node):
         HandleInput(
             name="knowledge_base",
             display_name="Knowledge Base",
-            input_types=["Message"],
-            info="From Knowledge Base component (auto-detects artifact types from uploaded files).",
+            input_types=["Data", "Message"],
+            info="From Knowledge Base component.",
             required=False,
         ),
-        MultilineInput(
-            name="additional_rules",
-            display_name="Additional Business Rules",
-            value="",
-            info="Extra business rules (free text, appended to context).",
-        ),
-        MultilineInput(
-            name="additional_context",
-            display_name="Additional Domain Context",
-            value="",
-            info="Extra domain context (free text).",
-        ),
+        MultilineInput(name="additional_rules", display_name="Additional Business Rules", value=""),
+        MultilineInput(name="additional_context", display_name="Additional Domain Context", value=""),
     ]
 
     outputs = [
         Output(display_name="Knowledge Context", name="output", method="build_output"),
     ]
 
-    def build_output(self) -> Data:
-        # Collect all raw inputs
-        raw_inputs = []
+    def _extract_files_from_kb(self, kb):
+        """Extract individual files from Knowledge Base output.
 
-        # From Knowledge Base (list of Data objects from uploaded files)
+        Returns list of (filename, parsed_content) tuples.
+        Handles: file paths, concatenated text, Data objects, Message objects.
+        """
+        files = []
+
+        # Get raw text from the KB output
+        text = None
+        if hasattr(kb, "text") and isinstance(kb.text, str):
+            text = kb.text.strip()
+        elif hasattr(kb, "data"):
+            inner = kb.data
+            if isinstance(inner, str):
+                text = inner.strip()
+            elif isinstance(inner, dict):
+                text = (inner.get("text") or inner.get("content") or inner.get("file_content") or "").strip()
+        elif isinstance(kb, str):
+            text = kb.strip()
+
+        if not text:
+            return files
+
+        # Check if text contains file paths (lines ending in .yaml, .json, etc.)
+        text_lines = [l.strip() for l in text.replace('\r\n', '\n').split('\n') if l.strip()]
+        sample = text_lines[:min(5, len(text_lines))]
+        looks_like_paths = len(sample) > 0 and all(
+            any(l.lower().endswith(ext) for ext in ('.yaml', '.yml', '.json', '.txt', '.md', '.csv'))
+            and ('/' in l or '\\' in l)
+            for l in sample
+        )
+
+        if looks_like_paths:
+            # Input is file paths — read each file
+            for line in text_lines:
+                path = line.strip().strip('"').strip("'")
+                if not path:
+                    continue
+                content = _read_file(path)
+                if content:
+                    filename = os.path.basename(path)
+                    parsed = _parse_content(content, filename)
+                    if parsed is not None:
+                        files.append((filename, parsed))
+        else:
+            # Input is raw content — treat as single document or concatenated
+            parsed = _parse_content(text)
+            if parsed is not None:
+                files.append(("", parsed))
+
+        return files
+
+    def build_output(self) -> Data:
+        all_files = []  # list of (filename, parsed_content)
+        debug_info = {}
+
+        # From Knowledge Base
         kb = self.knowledge_base
         if kb and kb != "":
-            if isinstance(kb, list):
-                for item in kb:
-                    raw_inputs.append(item)
-            else:
-                raw_inputs.append(kb)
+            debug_info["kb_type"] = str(type(kb).__name__)
+            debug_info["kb_has_text"] = hasattr(kb, "text")
+            debug_info["kb_has_data"] = hasattr(kb, "data")
+            if hasattr(kb, "text"):
+                txt = str(kb.text) if kb.text else ""
+                debug_info["kb_text_length"] = len(txt)
+                debug_info["kb_text_preview"] = txt[:300]
+            if hasattr(kb, "data"):
+                d = kb.data
+                debug_info["kb_data_type"] = str(type(d).__name__)
+                if isinstance(d, dict):
+                    debug_info["kb_data_keys"] = list(d.keys())[:10]
+                elif isinstance(d, str):
+                    debug_info["kb_data_preview"] = d[:200]
+
+            extracted = self._extract_files_from_kb(kb)
+            all_files.extend(extracted)
+            debug_info["kb_files_extracted"] = len(extracted)
+            debug_info["kb_file_names"] = [f[0] for f in extracted]
 
         # From text input (for quick testing)
         text_in = self.input_value
-        if text_in and text_in.strip():
-            if text_in.startswith('"') and text_in.endswith('"'):
-                text_in = text_in[1:-1]
-            raw_inputs.append(text_in)
+        if text_in and isinstance(text_in, str) and text_in.strip():
+            parsed = _parse_content(text_in.strip())
+            if parsed is not None:
+                all_files.append(("text_input", parsed))
 
-        if not raw_inputs:
-            self.status = "No knowledge inputs provided"
-            return Data(data={"error": True, "message": "No knowledge inputs. Connect Knowledge Base or paste text."})
+        if not all_files:
+            self.status = "No knowledge inputs parsed"
+            return Data(data={"error": True, "message": "No knowledge inputs parsed.", "_debug": debug_info})
 
-        # Parse and auto-detect each input
+        # Detect artifact types and assign to slots
         slots = {}
         files_detected = []
+        name_map = {
+            "knowledge_graph_file": "Knowledge Graph", "ontology_file": "Ontology",
+            "semantic_layer_file": "Semantic Layer", "context_graph_file": "Context Graph",
+            "synonyms_file": "Synonyms", "business_rules_file": "Business Rules",
+            "examples_file": "Few-Shot Examples", "domain_terms_file": "Domain Terms",
+            "schema_columns_file": "Schema Columns", "sql_templates_file": "SQL Templates",
+            "anti_patterns_file": "Anti-Patterns", "column_values_file": "Column Values",
+            "entities_aliases_file": "Entity Aliases",
+        }
 
-        for raw in raw_inputs:
-            parsed = _safe_parse(raw)
-            if parsed is None:
-                continue
-
-            # Try to get filename for fallback detection
-            filename = ""
-            if hasattr(raw, "data") and isinstance(raw.data, dict):
-                filename = raw.data.get("file_name", raw.data.get("source", ""))
-
-            slot = _detect_artifact_type(parsed, filename)
+        for filename, parsed in all_files:
+            slot = _detect_type_by_content(parsed, filename)
             if slot:
                 slots[slot] = parsed
-                name_map = {
-                    "knowledge_graph_file": "Knowledge Graph",
-                    "ontology_file": "Ontology",
-                    "semantic_layer_file": "Semantic Layer",
-                    "context_graph_file": "Context Graph",
-                    "synonyms_file": "Synonyms",
-                    "business_rules_file": "Business Rules",
-                    "examples_file": "Few-Shot Examples",
-                    "domain_terms_file": "Domain Terms",
-                    "schema_columns_file": "Schema Columns",
-                    "sql_templates_file": "SQL Templates",
-                    "anti_patterns_file": "Anti-Patterns",
-                    "column_values_file": "Column Values",
-                    "entities_aliases_file": "Entity Aliases",
-                }
-                display_name = name_map.get(slot, slot)
-                item_count = len(parsed) if isinstance(parsed, (dict, list)) else 1
-                files_detected.append({"name": display_name, "items": item_count})
-
-        # Extract parsed data by slot
-        knowledge_graph = slots.get("knowledge_graph_file")
-        ontology = slots.get("ontology_file")
-        semantic_layer = slots.get("semantic_layer_file")
-        context_graph = slots.get("context_graph_file")
-        synonyms_data = slots.get("synonyms_file")
-        business_rules_data = slots.get("business_rules_file")
-        examples_data = slots.get("examples_file")
-        domain_terms = slots.get("domain_terms_file")
-        schema_columns = slots.get("schema_columns_file")
-        sql_templates_data = slots.get("sql_templates_file")
-        anti_patterns_data = slots.get("anti_patterns_file")
-        column_values_data = slots.get("column_values_file")
-        entities_aliases_data = slots.get("entities_aliases_file")
+                display = name_map.get(slot, slot)
+                count = len(parsed) if isinstance(parsed, (dict, list)) else 1
+                files_detected.append({"name": display, "items": count, "filename": filename})
 
         loaded = len(files_detected)
 
         # Build unified structures
-        synonym_map = _build_synonym_map(synonyms_data, semantic_layer, domain_terms)
-        entities = _build_entities(knowledge_graph, semantic_layer)
-        hierarchies = _build_hierarchies(ontology)
-        business_rules = _build_business_rules(business_rules_data)
-        column_value_hints = _build_column_value_hints(semantic_layer)
-        column_metadata = _build_column_metadata(schema_columns, semantic_layer)
-        examples = _index_examples(examples_data)
-        sql_templates = _build_sql_templates(sql_templates_data)
-        anti_patterns = _build_anti_patterns(anti_patterns_data)
-        column_values_detailed = _build_column_values(column_values_data)
-        entity_aliases = _build_entity_aliases(entities_aliases_data)
-        valid_combinations = _build_valid_combinations(ontology)
+        synonym_map = _build_synonym_map(slots.get("synonyms_file"), slots.get("semantic_layer_file"), slots.get("domain_terms_file"))
+        entities = _build_entities(slots.get("knowledge_graph_file"), slots.get("semantic_layer_file"))
+        hierarchies = _build_hierarchies(slots.get("ontology_file"))
+        business_rules = _build_business_rules(slots.get("business_rules_file"))
+        column_metadata = _build_column_metadata(slots.get("schema_columns_file"), slots.get("semantic_layer_file"))
+        examples = _index_examples(slots.get("examples_file"))
+        intent_index = _build_intent_index(slots.get("context_graph_file"))
+        entity_aliases = _build_entity_aliases(slots.get("entities_aliases_file"))
 
-        # Build intent index
-        intent_index = {}
-        if context_graph and isinstance(context_graph, dict):
-            intent_index = _build_intent_index(context_graph)
+        valid_combos = {}
+        ont = slots.get("ontology_file")
+        if ont:
+            valid_combos = {"valid_combinations": ont.get("valid_combinations", {}),
+                            "constraints": ont.get("constraints", {})}
 
         additional_rules = (self.additional_rules or "").strip()
         additional_context = (self.additional_context or "").strip()
@@ -718,19 +677,18 @@ class CodeEditorNode(Node):
             "entities": entities,
             "hierarchies": hierarchies,
             "business_rules": business_rules,
-            "column_value_hints": column_value_hints,
+            "column_value_hints": {},
             "column_metadata": column_metadata,
             "examples": examples,
             "intent_patterns": {},
-            "valid_combinations": valid_combinations,
+            "valid_combinations": valid_combos,
             "intent_index": intent_index,
-            "sql_templates": sql_templates,
-            "anti_patterns": anti_patterns,
-            "column_values_detailed": column_values_detailed,
+            "sql_templates": {},
+            "anti_patterns": [],
+            "column_values_detailed": {},
             "entity_aliases": entity_aliases,
             "additional_business_rules": additional_rules,
             "additional_domain_context": additional_context,
-            # Metadata
             "knowledge_files_loaded": loaded,
             "total_knowledge_slots": 13,
             "synonym_count": len(synonym_map),
@@ -738,50 +696,24 @@ class CodeEditorNode(Node):
             "hierarchy_count": len(hierarchies),
             "example_count": len(examples),
             "column_count": len(column_metadata),
-            "sql_template_count": len(sql_templates),
-            "anti_pattern_count": len(anti_patterns),
-            "column_values_count": len(column_values_detailed),
             "entity_alias_count": len(entity_aliases),
             "files_detected": files_detected,
+            "_debug": debug_info,
         }
 
-        self.status = (
-            f"Loaded: {loaded}/13 | {len(synonym_map)} synonyms, "
-            f"{len(entities)} entities, {len(examples)} examples, "
-            f"{len(sql_templates)} templates, {len(anti_patterns)} anti-patterns, "
-            f"{len(entity_aliases)} aliases"
-        )
+        self.status = f"Loaded: {loaded}/13 | {len(synonym_map)} synonyms, {len(entities)} entities, {len(examples)} examples"
 
-        # Format readable summary for Chat Output
-        parts = [
-            f"**Knowledge Processor** (pure code -- no LLM)\n",
-            f"**Files Detected:** {loaded}/13",
-        ]
+        # Summary text
+        parts = [f"**Knowledge Processor** (pure code -- no LLM)\n", f"**Files Detected:** {loaded}/13"]
         for fd in files_detected:
-            parts.append(f"  - {fd['name']} ({fd['items']} items)")
-
-        counts = [
-            ("Synonyms", len(synonym_map)),
-            ("Entities", len(entities)),
-            ("Hierarchies", len(hierarchies)),
-            ("Examples", len(examples)),
-            ("Columns", len(column_metadata)),
-            ("SQL Templates", len(sql_templates)),
-            ("Anti-Patterns", len(anti_patterns)),
-            ("Column Values", len(column_values_detailed)),
-            ("Entity Aliases", len(entity_aliases)),
-        ]
+            parts.append(f"  - {fd['name']} ({fd['items']} items) [{fd['filename']}]")
         parts.append("\n**Knowledge Summary:**")
-        for name, count in counts:
+        for label, count in [("Synonyms", len(synonym_map)), ("Entities", len(entities)),
+                             ("Hierarchies", len(hierarchies)), ("Examples", len(examples)),
+                             ("Columns", len(column_metadata)), ("Entity Aliases", len(entity_aliases))]:
             if count > 0:
-                parts.append(f"  - {name}: {count}")
+                parts.append(f"  - {label}: {count}")
 
-        if additional_rules:
-            parts.append(f"\n**Additional Rules:** {additional_rules[:200]}...")
-        if additional_context:
-            parts.append(f"**Additional Context:** {additional_context[:200]}...")
-
-        # Return Data with the text representation for display
         result = Data(data=context)
         result.text_key = "summary"
         context["summary"] = "\n".join(parts)
