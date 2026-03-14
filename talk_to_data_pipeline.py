@@ -203,7 +203,8 @@ class CodeEditorNode(Node):
         if entity_aliases:
             text_lower = text.lower()
             for alias in sorted(entity_aliases.keys(), key=len, reverse=True):
-                if alias in text_lower:
+                # Word-boundary match to avoid false positives (e.g. "esp" matching "responsible")
+                if re.search(r"\b" + re.escape(alias) + r"\b", text_lower):
                     info = entity_aliases[alias]
                     alias_resolutions.append({
                         "alias": alias,
@@ -471,7 +472,7 @@ Return ONLY JSON."""
             sections.append(f"\n**SQL Rules:**\nUse LIMIT {mr} to cap results.")
 
         sections.append(f"\n**User Question:** {normalized_query}")
-        sections.append(f"\n**Rules:**\n1. SELECT only\n2. Use exact column names\n3. GROUP BY for aggregations\n4. Return ONLY the SQL, no explanations")
+        sections.append(f"\n**Rules:**\n1. SELECT only\n2. Use exact column names\n3. GROUP BY for aggregations\n4. Return ONLY the SQL, no explanations\n5. For name/text filters (SUPPLIER_NAME, PLANT_NAME, etc.), use UPPER(col) LIKE UPPER('%value%') for partial matching, NOT exact equality\n6. Do NOT add filters the user did not ask for (e.g. do not add REGION filters unless the user mentions a region)")
 
         if self.extra_rules and self.extra_rules.strip():
             sections.append(self.extra_rules.strip())
