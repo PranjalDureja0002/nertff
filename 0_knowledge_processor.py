@@ -513,6 +513,44 @@ def _build_intent_index(context_graph):
     return index
 
 
+def _build_anti_patterns(data):
+    """Extract anti-patterns list from parsed data."""
+    if not data:
+        return []
+    if isinstance(data, list):
+        return data
+    ap = data.get("anti_patterns", data)
+    if isinstance(ap, list):
+        return ap
+    if isinstance(ap, dict):
+        result = []
+        for name, info in ap.items():
+            if isinstance(info, dict):
+                result.append({"name": name, **info})
+            else:
+                result.append({"name": name, "description": str(info)})
+        return result
+    return []
+
+
+def _build_sql_templates(data):
+    """Extract SQL templates dict from parsed data."""
+    if not data:
+        return {}
+    if isinstance(data, dict):
+        return data.get("templates", data)
+    return {}
+
+
+def _build_column_values(data):
+    """Extract column value hints from parsed data."""
+    if not data:
+        return {}
+    if isinstance(data, dict):
+        return data.get("columns", data.get("histograms", data))
+    return {}
+
+
 def _build_entity_aliases(aliases_data):
     aliases = {}
     if not aliases_data:
@@ -680,6 +718,9 @@ class CodeEditorNode(Node):
         examples = _index_examples(slots.get("examples_file"))
         intent_index = _build_intent_index(slots.get("context_graph_file"))
         entity_aliases = _build_entity_aliases(slots.get("entities_aliases_file"))
+        anti_patterns = _build_anti_patterns(slots.get("anti_patterns_file"))
+        sql_templates = _build_sql_templates(slots.get("sql_templates_file"))
+        column_values = _build_column_values(slots.get("column_values_file"))
 
         valid_combos = {}
         ont = slots.get("ontology_file")
@@ -701,9 +742,9 @@ class CodeEditorNode(Node):
             "intent_patterns": {},
             "valid_combinations": valid_combos,
             "intent_index": intent_index,
-            "sql_templates": {},
-            "anti_patterns": [],
-            "column_values_detailed": {},
+            "sql_templates": sql_templates,
+            "anti_patterns": anti_patterns,
+            "column_values_detailed": column_values,
             "entity_aliases": entity_aliases,
             "additional_business_rules": additional_rules,
             "additional_domain_context": additional_context,
@@ -715,6 +756,9 @@ class CodeEditorNode(Node):
             "example_count": len(examples),
             "column_count": len(column_metadata),
             "entity_alias_count": len(entity_aliases),
+            "anti_pattern_count": len(anti_patterns),
+            "sql_template_count": len(sql_templates),
+            "column_values_count": len(column_values),
             "files_detected": files_detected,
             "_debug": debug_info,
         }
@@ -728,7 +772,9 @@ class CodeEditorNode(Node):
         parts.append("\n**Knowledge Summary:**")
         for label, count in [("Synonyms", len(synonym_map)), ("Entities", len(entities)),
                              ("Hierarchies", len(hierarchies)), ("Examples", len(examples)),
-                             ("Columns", len(column_metadata)), ("Entity Aliases", len(entity_aliases))]:
+                             ("Columns", len(column_metadata)), ("Entity Aliases", len(entity_aliases)),
+                             ("Anti-Patterns", len(anti_patterns)), ("SQL Templates", len(sql_templates)),
+                             ("Column Values", len(column_values))]:
             if count > 0:
                 parts.append(f"  - {label}: {count}")
 
