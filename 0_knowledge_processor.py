@@ -69,37 +69,55 @@ def _parse_content(text, filename=""):
 
 # ─── Filename-Based Type Detection ───────────────────────────────────────────
 
-_FILENAME_TO_TYPE = {
-    "knowledge_graph": "knowledge_graph_file",
-    "context_graph": "context_graph_file",
-    "semantic_layer": "semantic_layer_file",
-    "semantic": "semantic_layer_file",
-    "ontology": "ontology_file",
-    "synonym": "synonyms_file",
-    "business_rule": "business_rules_file",
-    "example": "examples_file",
-    "german_term": "domain_terms_file",
-    "german_column": "domain_terms_file",
-    "domain_term": "domain_terms_file",
-    "column_value": "column_values_file",
-    "histogram": "column_values_file",
-    "alias": "entities_aliases_file",
-    "entities_alias": "entities_aliases_file",
-    "anti_pattern": "anti_patterns_file",
-    "sql_template": "sql_templates_file",
-    "template": "sql_templates_file",
-    "columns": "schema_columns_file",
-}
+# Keywords mapped to artifact types — matched against normalized filename
+# Order matters: longer/more-specific keys first to avoid false positives
+_FILENAME_KEYWORDS = [
+    (["knowledgegraph", "knowledge_graph", "kg"],          "knowledge_graph_file"),
+    (["contextgraph", "context_graph"],                     "context_graph_file"),
+    (["semanticlayer", "semantic_layer", "semantic"],        "semantic_layer_file"),
+    (["ontology"],                                          "ontology_file"),
+    (["synonym", "synonymn", "synonyms"],                   "synonyms_file"),
+    (["businessrule", "business_rule", "business_rules"],   "business_rules_file"),
+    (["example", "examples", "fewshot", "few_shot"],        "examples_file"),
+    (["germanterm", "german_term", "german_column",
+     "domainterm", "domain_term"],                          "domain_terms_file"),
+    (["columnvalue", "column_value", "histogram"],          "column_values_file"),
+    (["entityalias", "entities_alias", "alias"],            "entities_aliases_file"),
+    (["antipattern", "anti_pattern"],                       "anti_patterns_file"),
+    (["sqltemplate", "sql_template", "template"],           "sql_templates_file"),
+    (["columns", "schema_columns"],                         "schema_columns_file"),
+]
+
+
+def _normalize_filename(filename):
+    """Normalize filename for flexible matching.
+
+    'Context Graph (1).yaml' -> 'contextgraph'
+    'business_rules.YAML'    -> 'businessrules'
+    'SemanticLayer-v2.json'  -> 'semanticlayerv2'
+    """
+    base = os.path.basename(filename).rsplit(".", 1)[0]  # strip extension
+    base = base.lower()
+    base = re.sub(r'\(\d+\)', '', base)       # remove (1), (2) etc.
+    base = re.sub(r'[^a-z0-9]', '', base)     # strip all non-alphanumeric
+    return base
 
 
 def _detect_type_by_filename(filename):
-    """Detect artifact type from filename."""
+    """Detect artifact type from filename — flexible matching.
+
+    Handles: case variations, spaces/underscores/hyphens, (1) suffixes,
+    CamelCase, version numbers, any extension.
+    """
     if not filename:
         return None
-    base = os.path.basename(filename).rsplit(".", 1)[0].lower()
-    for hint, slot in _FILENAME_TO_TYPE.items():
-        if hint in base:
-            return slot
+    normalized = _normalize_filename(filename)
+    if not normalized:
+        return None
+    for keywords, slot in _FILENAME_KEYWORDS:
+        for kw in keywords:
+            if kw in normalized:
+                return slot
     return None
 
 
